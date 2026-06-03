@@ -1,0 +1,460 @@
+import cors from 'cors';
+import dotenv from 'dotenv';
+import express from 'express';
+import PocketBase from 'pocketbase';
+import Stripe from 'stripe';
+
+dotenv.config();
+
+const app = express();
+const PORT = Number(process.env.PORT) || 4000;
+
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+const stripePriceId = process.env.STRIPE_PRICE_ID;
+const clientUrl = process.env.CLIENT_URL;
+const pocketbaseUrl = process.env.POCKETBASE_URL;
+const pbAdminEmail = process.env.PB_ADMIN_EMAIL;
+const pbAdminPassword = process.env.PB_ADMIN_PASSWORD;
+const workspacesCollection = process.env.PB_WORKSPACES_COLLECTION || 'workspaces';
+const usersCollection = process.env.PB_USERS_COLLECTION || 'users';
+const defaultWorkspaceName = process.env.DEFAULT_WORKSPACE_NAME || 'Office Device Inventory';
+const defaultWorkspaceId = process.env.DEFAULT_WORKSPACE_ID || '7hdaukcpiuzejeh';
+
+if (!stripeSecretKey || !stripeWebhookSecret || !stripePriceId || !clientUrl || !pocketbaseUrl || !pbAdminEmail || !pbAdminPassword) {
+  throw new Error('Missing required backend environment variables.');
+}
+
+const stripe = new Stripe(stripeSecretKey);
+
+// Применяем CORS в самом начале для всех эндпоинтов, включая вебхуки
+app.use(cors({ origin: true }));
+
+function jsonError(res, status, message, details) {
+  res.status(status).json({
+    error: message,
+    ...(details ? { details } : {}),
+  });
+}
+
+/**
+ * Генерирует изолированный, авторизованный клиент PocketBase для админских нужд.
+ * Спасает от race condition при параллельных запросах на сервере.
+ */
+async function createAdminClient() {
+  const pbAdmin = new PocketBase(pocketbaseUrl);
+  pbAdmin.autoCancellation(false);
+  await pbAdmin.admins.authWithPassword(pbAdminEmail, pbAdminPassword);
+  return pbAdmin;
+}
+
+async function getWorkspace(workspaceId) {
+  const pbAdmin = await createAdminClient();
+  return pbAdmin.collection(workspacesCollection).getOne(workspaceId);
+}
+
+async function updateWorkspace(workspaceId, payload) {
+  const pbAdmin = await createAdminClient();
+  return pbAdmin.collection(workspacesCollection).update(workspaceId, payload);
+}
+
+async function resolveStripeCustomerId({ workspace, userEmail }) {
+  const existingCustomerId = workspace?.stripe_customer_id || '';
+  if (existingCustomerId) {
+    return existingCustomerId;
+  }
+
+  if (!userEmail) {
+    return '';
+  }
+
+  const customers = await stripe.customers.list({
+    email: userEmail,
+    limit: 1,
+  });
+
+  return customers.data?.[0]?.id || '';
+}
+
+async function syncWorkspaceSubscriptionStatus({ workspaceId, userEmail }) {
+  const workspace = await getWorkspace(workspaceId);
+  const customerId = await resolveStripeCustomerId({ workspace, userEmail });
+
+  if (!customerId) {
+    return {
+      workspace,
+      status: workspace.subscription_status || 'inactive',
+      updated: false,
+    };
+  }
+
+  const subscriptions = await stripe.subscriptions.list({
+    customer: customerId,
+    status: 'all',
+    limit: 10,
+  });
+
+  const activeLike = subscriptions.data.find((item) => item.status === 'active' || item.status === 'trialing');
+  const latest = subscriptions.data[0] || null;
+  const selected = activeLike || latest;
+
+  const selectedStatus = selected?.status || 'inactive';
+  const isActiveLike = selectedStatus === 'active' || selectedStatus === 'trialing';
+
+  const payload = {
+    subscription_status: isActiveLike ? selectedStatus : selectedStatus === 'past_due' ? 'past_due' : selectedStatus === 'canceled' ? 'canceled' : 'inactive',
+    device_limit: isActiveLike ? 1000000 : 10,
+    stripe_customer_id: customerId,
+    stripe_subscription_id: selected?.id || '',
+    stripe_price_id: selected?.items?.data?.[0]?.price?.id || workspace.stripe_price_id || stripePriceId,
+  };
+
+  const updatedWorkspace = await updateWorkspace(workspaceId, payload);
+
+  return {
+    workspace: updatedWorkspace,
+    status: payload.subscription_status,
+    updated: true,
+  };
+}
+
+async function findUserByEmail(email) {
+  if (!email) {
+    return null;
+  }
+
+  const pbAdmin = await createAdminClient();
+
+  try {
+    return await pbAdmin.collection(usersCollection).getFirstListItem(`email = "${email}"`);
+  } catch (error) {
+    if (error?.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function getDefaultWorkspace() {
+  const pbAdmin = await createAdminClient();
+
+  try {
+    return await pbAdmin.collection(workspacesCollection).getOne(defaultWorkspaceId);
+  } catch (error) {
+    if (error?.status !== 404) {
+      throw error;
+    }
+  }
+
+  try {
+    return await pbAdmin.collection(workspacesCollection).getFirstListItem(`name = "${defaultWorkspaceName}"`);
+  } catch (error) {
+    if (error?.status !== 404) {
+      throw error;
+    }
+  }
+
+  return pbAdmin.collection(workspacesCollection).create({
+    name: defaultWorkspaceName,
+    subscription_status: 'inactive',
+    device_limit: 10,
+  });
+}
+
+async function attachUserToWorkspace(userId, workspaceId) {
+  const pbAdmin = await createAdminClient();
+  return pbAdmin.collection(usersCollection).update(userId, { workspace: workspaceId });
+}
+
+async function resolveWorkspaceIdFromCheckoutSession(session) {
+  const fromMetadata = session?.metadata?.workspaceId;
+  if (fromMetadata) {
+    return fromMetadata;
+  }
+
+  const fromClientRef = session?.client_reference_id;
+  if (fromClientRef) {
+    return fromClientRef;
+  }
+
+  const customerEmail = session?.customer_details?.email || session?.customer_email || '';
+  const user = await findUserByEmail(customerEmail);
+
+  if (!user) {
+    return defaultWorkspaceId;
+  }
+
+  if (Array.isArray(user.workspace)) {
+    return user.workspace[0] || '';
+  }
+
+  const relationId = typeof user.workspace === 'string' ? user.workspace : '';
+  return relationId || defaultWorkspaceId;
+}
+
+async function resolveWorkspaceIdFromSubscription(subscription) {
+  const fromMetadata = subscription?.metadata?.workspaceId;
+  if (fromMetadata) {
+    return fromMetadata;
+  }
+
+  const customerId = subscription?.customer || '';
+
+  if (!customerId) {
+    return defaultWorkspaceId;
+  }
+
+  const pbAdmin = await createAdminClient();
+
+  try {
+    const workspace = await pbAdmin.collection(workspacesCollection).getFirstListItem(`stripe_customer_id = "${customerId}"`);
+    return workspace.id;
+  } catch (error) {
+    if (error?.status === 404) {
+      return defaultWorkspaceId;
+    }
+    throw error;
+  }
+}
+
+// Эндпоинт вебхука ожидает строго сырые данные (raw body)
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+
+  try {
+    const signature = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(req.body, signature, stripeWebhookSecret);
+  } catch (error) {
+    jsonError(res, 400, `Webhook Error: ${error.message}`);
+    return;
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const workspaceId = (await resolveWorkspaceIdFromCheckoutSession(session)) || defaultWorkspaceId;
+
+      if (workspaceId && session.subscription) {
+        await updateWorkspace(workspaceId, {
+          subscription_status: 'active',
+          device_limit: 1000000,
+          stripe_customer_id: session.customer || '',
+          stripe_subscription_id: session.subscription,
+          stripe_price_id: stripePriceId,
+        });
+      }
+    }
+
+    if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+      const workspaceId = (await resolveWorkspaceIdFromSubscription(subscription)) || defaultWorkspaceId;
+
+      if (workspaceId) {
+        const status = subscription.status;
+        const isActiveLike = status === 'active' || status === 'trialing';
+
+        await updateWorkspace(workspaceId, {
+          subscription_status: isActiveLike ? status : status === 'past_due' ? 'past_due' : status === 'canceled' ? 'canceled' : 'inactive',
+          device_limit: isActiveLike ? 1000000 : 10,
+          stripe_customer_id: subscription.customer || '',
+          stripe_subscription_id: subscription.id,
+          stripe_price_id: subscription.items?.data?.[0]?.price?.id || stripePriceId,
+        });
+      }
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    jsonError(res, 500, error.message || 'Webhook handling failed.');
+  }
+});
+
+// Парсер JSON применяется исключительно для остальных прикладных эндпоинтов
+app.use(express.json());
+
+app.post('/api/create-subscription-checkout-session', async (req, res) => {
+  const { workspaceId, userEmail } = req.body || {};
+
+  if (!workspaceId) {
+    jsonError(res, 400, 'workspaceId is required.');
+    return;
+  }
+
+  try {
+    const workspace = await getWorkspace(workspaceId);
+    let customerId = workspace.stripe_customer_id || '';
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: userEmail || undefined,
+        metadata: { workspaceId },
+      });
+
+      customerId = customer.id;
+
+      await updateWorkspace(workspaceId, {
+        stripe_customer_id: customerId,
+      });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price: stripePriceId,
+          quantity: 1,
+        },
+      ],
+      success_url: `${clientUrl}/billing?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/billing?canceled=1`,
+      metadata: { workspaceId },
+      subscription_data: {
+        metadata: { workspaceId },
+      },
+    });
+
+    if (!session?.url) {
+      jsonError(res, 502, 'Stripe checkout session did not return a redirect URL.');
+      return;
+    }
+
+    res.json({ url: session.url });
+  } catch (error) {
+    jsonError(res, 500, error.message || 'Failed to create subscription checkout session.');
+  }
+});
+
+app.post('/api/billing/confirm-session', async (req, res) => {
+  const { sessionId, workspaceId: workspaceIdFromClient } = req.body || {};
+
+  if (!sessionId) {
+    jsonError(res, 400, 'sessionId is required.');
+    return;
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['subscription'],
+    });
+
+    if (session.mode !== 'subscription') {
+      jsonError(res, 400, 'Checkout session is not a subscription session.');
+      return;
+    }
+
+    if (session.payment_status !== 'paid') {
+      jsonError(res, 409, 'Checkout session is not paid yet.');
+      return;
+    }
+
+    let workspaceId = await resolveWorkspaceIdFromCheckoutSession(session);
+
+    if (!workspaceId && workspaceIdFromClient) {
+      workspaceId = workspaceIdFromClient;
+    }
+
+    if (!workspaceId) {
+      workspaceId = defaultWorkspaceId;
+    }
+
+    await updateWorkspace(workspaceId, {
+      subscription_status: 'active',
+      device_limit: 1000000,
+      stripe_customer_id: session.customer || '',
+      stripe_subscription_id: typeof session.subscription === 'string' ? session.subscription : session.subscription?.id || '',
+      stripe_price_id: stripePriceId,
+    });
+
+    res.json({
+      workspaceId,
+      status: 'active',
+    });
+  } catch (error) {
+    jsonError(res, 500, error.message || 'Failed to confirm Stripe checkout session.');
+  }
+});
+
+app.post('/api/billing/sync-workspace-subscription', async (req, res) => {
+  const { workspaceId, userEmail } = req.body || {};
+
+  if (!workspaceId) {
+    jsonError(res, 400, 'workspaceId is required.');
+    return;
+  }
+
+  try {
+    const result = await syncWorkspaceSubscriptionStatus({ workspaceId, userEmail });
+    res.json({
+      workspaceId,
+      subscription_status: result.status,
+      updated: result.updated,
+    });
+  } catch (error) {
+    jsonError(res, 500, error.message || 'Failed to sync workspace subscription status.');
+  }
+});
+
+app.post('/api/billing/activate-workspace', async (req, res) => {
+  const { workspaceId } = req.body || {};
+  const targetWorkspaceId = workspaceId || defaultWorkspaceId;
+
+  if (!targetWorkspaceId) {
+    jsonError(res, 400, 'workspaceId is required.');
+    return;
+  }
+
+  try {
+    const updated = await updateWorkspace(targetWorkspaceId, {
+      subscription_status: 'active',
+      device_limit: 1000000,
+    });
+
+    res.json({
+      workspaceId: updated.id,
+      subscription_status: updated.subscription_status || 'active',
+      updated: true,
+    });
+  } catch (error) {
+    jsonError(res, 500, error.message || 'Failed to activate workspace subscription.');
+  }
+});
+
+app.post('/api/users/attach-workspace', async (req, res) => {
+  const { userId } = req.body || {};
+
+  if (!userId) {
+    jsonError(res, 400, 'userId is required.');
+    return;
+  }
+
+  try {
+    const workspace = await getDefaultWorkspace();
+    await attachUserToWorkspace(userId, workspace.id);
+
+    res.json({
+      userId,
+      workspaceId: workspace.id,
+      workspaceName: workspace.name,
+    });
+  } catch (error) {
+    jsonError(res, 500, error.message || 'Failed to attach user to workspace.');
+  }
+});
+
+app.use('/api', (_req, res) => {
+  jsonError(res, 404, 'API endpoint not found.');
+});
+
+app.use((error, _req, res, _next) => {
+  if (res.headersSent) {
+    return;
+  }
+  jsonError(res, error?.status || 500, error?.message || 'Internal server error.');
+});
+
+app.listen(PORT, () => {
+  console.log(`Stripe backend listening on port ${PORT}`);
+});
+
