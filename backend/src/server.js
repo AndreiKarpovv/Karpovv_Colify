@@ -19,7 +19,7 @@ const pbAdminPassword = process.env.PB_ADMIN_PASSWORD;
 const workspacesCollection = process.env.PB_WORKSPACES_COLLECTION || 'workspaces';
 const usersCollection = process.env.PB_USERS_COLLECTION || 'users';
 const defaultWorkspaceName = process.env.DEFAULT_WORKSPACE_NAME || 'Office Device Inventory';
-const defaultWorkspaceId = process.env.DEFAULT_WORKSPACE_ID || '7hdaukcpiuzejeh';
+const defaultWorkspaceId = process.env.DEFAULT_WORKSPACE_ID || '4j3jbzp169t8anp';
 
 if (!stripeSecretKey || !stripeWebhookSecret || !stripePriceId || !clientUrl || !pocketbaseUrl || !pbAdminEmail || !pbAdminPassword) {
   throw new Error('Missing required backend environment variables.');
