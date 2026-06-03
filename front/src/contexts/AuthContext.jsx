@@ -8,7 +8,7 @@ export const AuthContext = createContext(null);
 
 const noWorkspaceMessage = 'Your account is not attached to a workspace. Contact administrator.';
 const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:4000';
-const REQUIRED_WORKSPACE_ID = '7hdaukcpiuzejeh';
+const REQUIRED_WORKSPACE_ID = '4j3jbzp169t8anp';
 
 async function attachUserToDefaultWorkspace(userId) {
   if (!userId) {
