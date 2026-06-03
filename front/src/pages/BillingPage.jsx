@@ -174,28 +174,19 @@ export function BillingPage() {
     setError('');
 
     try {
-      let url = '';
+      // Никаких проверок хостинг-ссылок. Стучимся СТРОГО на твой Express-бэк
+      const payload = await createSubscriptionCheckoutSession({
+        workspaceId: summary.workspace.id,
+        userEmail: pb.authStore.record?.email,
+      });
 
-      if (hasHostedPaymentLink()) {
-        url = getHostedPaymentLink({
-          workspaceId: summary.workspace.id,
-          userEmail: pb.authStore.record?.email,
-        });
-      } else {
-        const payload = await createSubscriptionCheckoutSession({
-          workspaceId: summary.workspace.id,
-          userEmail: pb.authStore.record?.email,
-        });
-
-        url = payload.url;
-      }
+      const url = payload?.url;
 
       if (!url) {
-        throw new Error('Checkout URL is not configured.');
+        throw new Error('Checkout URL was not returned from the backend.');
       }
 
       window.localStorage.setItem(pendingWorkspaceStorageKey, summary.workspace.id);
-
       window.location.href = url;
     } catch (upgradeError) {
       setError(upgradeError?.message || 'Failed to start Stripe Checkout.');
